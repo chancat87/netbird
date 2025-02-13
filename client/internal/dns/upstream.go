@@ -2,17 +2,23 @@ package dns
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
-	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
+	"github.com/hashicorp/go-multierror"
 	"github.com/miekg/dns"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/client/internal/peer"
 )
 
 const (
@@ -22,7 +28,7 @@ const (
 	probeTimeout     = 2 * time.Second
 )
 
-const testRecord = "."
+const testRecord = "com."
 
 type upstreamClient interface {
 	exchange(ctx context.Context, upstream string, r *dns.Msg) (*dns.Msg, time.Duration, error)
@@ -38,27 +44,52 @@ type upstreamResolverBase struct {
 	cancel           context.CancelFunc
 	upstreamClient   upstreamClient
 	upstreamServers  []string
+	domain           string
 	disabled         bool
 	failsCount       atomic.Int32
+	successCount     atomic.Int32
 	failsTillDeact   int32
 	mutex            sync.Mutex
 	reactivatePeriod time.Duration
 	upstreamTimeout  time.Duration
 
-	deactivate func()
-	reactivate func()
+	deactivate     func(error)
+	reactivate     func()
+	statusRecorder *peer.Status
 }
 
-func newUpstreamResolverBase(parentCTX context.Context) *upstreamResolverBase {
-	ctx, cancel := context.WithCancel(parentCTX)
+func newUpstreamResolverBase(ctx context.Context, statusRecorder *peer.Status, domain string) *upstreamResolverBase {
+	ctx, cancel := context.WithCancel(ctx)
 
 	return &upstreamResolverBase{
 		ctx:              ctx,
 		cancel:           cancel,
+		domain:           domain,
 		upstreamTimeout:  upstreamTimeout,
 		reactivatePeriod: reactivatePeriod,
 		failsTillDeact:   failsTillDeact,
+		statusRecorder:   statusRecorder,
 	}
+}
+
+// String returns a string representation of the upstream resolver
+func (u *upstreamResolverBase) String() string {
+	return fmt.Sprintf("upstream %v", u.upstreamServers)
+}
+
+// ID returns the unique handler ID
+func (u *upstreamResolverBase) id() handlerID {
+	servers := slices.Clone(u.upstreamServers)
+	slices.Sort(servers)
+
+	hash := sha256.New()
+	hash.Write([]byte(u.domain + ":"))
+	hash.Write([]byte(strings.Join(servers, ",")))
+	return handlerID("upstream-" + hex.EncodeToString(hash.Sum(nil)[:8]))
+}
+
+func (u *upstreamResolverBase) MatchSubdomains() bool {
+	return true
 }
 
 func (u *upstreamResolverBase) stop() {
@@ -68,12 +99,21 @@ func (u *upstreamResolverBase) stop() {
 
 // ServeDNS handles a DNS request
 func (u *upstreamResolverBase) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
-	defer u.checkUpstreamFails()
+	var err error
+	defer func() {
+		u.checkUpstreamFails(err)
+	}()
 
-	log.WithField("question", r.Question[0]).Trace("received an upstream question")
+	log.Tracef("received upstream question: domain=%s type=%v class=%v", r.Question[0].Name, r.Question[0].Qtype, r.Question[0].Qclass)
+	// set the AuthenticatedData flag and the EDNS0 buffer size to 4096 bytes to support larger dns records
+	if r.Extra == nil {
+		r.SetEdns0(4096, false)
+		r.MsgHdr.AuthenticatedData = true
+	}
 
 	select {
 	case <-u.ctx.Done():
+		log.Tracef("%s has been stopped", u)
 		return
 	default:
 	}
@@ -81,7 +121,6 @@ func (u *upstreamResolverBase) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	for _, upstream := range u.upstreamServers {
 		var rm *dns.Msg
 		var t time.Duration
-		var err error
 
 		func() {
 			ctx, cancel := context.WithTimeout(u.ctx, u.upstreamTimeout)
@@ -91,40 +130,36 @@ func (u *upstreamResolverBase) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || isTimeout(err) {
-				log.WithError(err).WithField("upstream", upstream).
-					Warn("got an error while connecting to upstream")
+				log.Warnf("upstream %s timed out for question domain=%s", upstream, r.Question[0].Name)
 				continue
 			}
-			u.failsCount.Add(1)
-			log.WithError(err).WithField("upstream", upstream).
-				Error("got other error while querying the upstream")
-			return
+			log.Warnf("failed to query upstream %s for question domain=%s: %s", upstream, r.Question[0].Name, err)
+			continue
 		}
 
-		if rm == nil {
-			log.WithError(err).WithField("upstream", upstream).
-				Warn("no response from upstream")
-			return
-		}
-		// those checks need to be independent of each other due to memory address issues
-		if !rm.Response {
-			log.WithError(err).WithField("upstream", upstream).
-				Warn("no response from upstream")
-			return
+		if rm == nil || !rm.Response {
+			log.Warnf("no response from upstream %s for question domain=%s", upstream, r.Question[0].Name)
+			continue
 		}
 
-		log.Tracef("took %s to query the upstream %s", t, upstream)
+		u.successCount.Add(1)
+		log.Tracef("took %s to query the upstream %s for question domain=%s", t, upstream, r.Question[0].Name)
 
-		err = w.WriteMsg(rm)
-		if err != nil {
-			log.WithError(err).Error("got an error while writing the upstream resolver response")
+		if err = w.WriteMsg(rm); err != nil {
+			log.Errorf("failed to write DNS response for question domain=%s: %s", r.Question[0].Name, err)
 		}
 		// count the fails only if they happen sequentially
 		u.failsCount.Store(0)
 		return
 	}
 	u.failsCount.Add(1)
-	log.Error("all queries to the upstream nameservers failed with timeout")
+	log.Errorf("all queries to the %s failed for question domain=%s", u, r.Question[0].Name)
+
+	m := new(dns.Msg)
+	m.SetRcode(r, dns.RcodeServerFailure)
+	if err := w.WriteMsg(m); err != nil {
+		log.Errorf("failed to write error response for %s for question domain=%s: %s", u, r.Question[0].Name, err)
+	}
 }
 
 // checkUpstreamFails counts fails and disables or enables upstream resolving
@@ -132,7 +167,7 @@ func (u *upstreamResolverBase) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 // If fails count is greater that failsTillDeact, upstream resolving
 // will be disabled for reactivatePeriod, after that time period fails counter
 // will be reset and upstream will be reactivated.
-func (u *upstreamResolverBase) checkUpstreamFails() {
+func (u *upstreamResolverBase) checkUpstreamFails(err error) {
 	u.mutex.Lock()
 	defer u.mutex.Unlock()
 
@@ -146,7 +181,7 @@ func (u *upstreamResolverBase) checkUpstreamFails() {
 	default:
 	}
 
-	u.disable()
+	u.disable(err)
 }
 
 // probeAvailability tests all upstream servers simultaneously and
@@ -161,17 +196,25 @@ func (u *upstreamResolverBase) probeAvailability() {
 	default:
 	}
 
+	// avoid probe if upstreams could resolve at least one query and fails count is less than failsTillDeact
+	if u.successCount.Load() > 0 && u.failsCount.Load() < u.failsTillDeact {
+		return
+	}
+
 	var success bool
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
+	var errors *multierror.Error
 	for _, upstream := range u.upstreamServers {
 		upstream := upstream
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := u.testNameserver(upstream); err != nil {
+			err := u.testNameserver(upstream, 500*time.Millisecond)
+			if err != nil {
+				errors = multierror.Append(errors, err)
 				log.Warnf("probing upstream nameserver %s: %s", upstream, err)
 				return
 			}
@@ -186,7 +229,7 @@ func (u *upstreamResolverBase) probeAvailability() {
 
 	// didn't find a working upstream server, let's disable and try later
 	if !success {
-		u.disable()
+		u.disable(errors.ErrorOrNil())
 	}
 }
 
@@ -210,7 +253,7 @@ func (u *upstreamResolverBase) waitUntilResponse() {
 		}
 
 		for _, upstream := range u.upstreamServers {
-			if err := u.testNameserver(upstream); err != nil {
+			if err := u.testNameserver(upstream, probeTimeout); err != nil {
 				log.Tracef("upstream check for %s: %s", upstream, err)
 			} else {
 				// at least one upstream server is available, stop probing
@@ -230,6 +273,7 @@ func (u *upstreamResolverBase) waitUntilResponse() {
 
 	log.Infof("upstreams %s are responsive again. Adding them back to system", u.upstreamServers)
 	u.failsCount.Store(0)
+	u.successCount.Add(1)
 	u.reactivate()
 	u.disabled = false
 }
@@ -245,22 +289,20 @@ func isTimeout(err error) bool {
 	return false
 }
 
-func (u *upstreamResolverBase) disable() {
+func (u *upstreamResolverBase) disable(err error) {
 	if u.disabled {
 		return
 	}
 
-	// todo test the deactivation logic, it seems to affect the client
-	if runtime.GOOS != "ios" {
-		log.Warnf("upstream resolving is Disabled for %v", reactivatePeriod)
-		u.deactivate()
-		u.disabled = true
-		go u.waitUntilResponse()
-	}
+	log.Warnf("Upstream resolving is Disabled for %v", reactivatePeriod)
+	u.successCount.Store(0)
+	u.deactivate(err)
+	u.disabled = true
+	go u.waitUntilResponse()
 }
 
-func (u *upstreamResolverBase) testNameserver(server string) error {
-	ctx, cancel := context.WithTimeout(u.ctx, probeTimeout)
+func (u *upstreamResolverBase) testNameserver(server string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(u.ctx, timeout)
 	defer cancel()
 
 	r := new(dns.Msg).SetQuestion(testRecord, dns.TypeSOA)

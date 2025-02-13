@@ -105,6 +105,7 @@ func (s *serviceViaListener) Stop() {
 }
 
 func (s *serviceViaListener) RegisterMux(pattern string, handler dns.Handler) {
+	log.Debugf("registering dns handler for pattern: %s", pattern)
 	s.dnsMux.Handle(pattern, handler)
 }
 
@@ -128,6 +129,9 @@ func (s *serviceViaListener) RuntimeIP() string {
 }
 
 func (s *serviceViaListener) setListenerStatus(running bool) {
+	s.listenerFlagLock.Lock()
+	defer s.listenerFlagLock.Unlock()
+
 	s.listenerIsRunning = running
 }
 

@@ -2,6 +2,7 @@ package peer
 
 import (
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -42,6 +43,7 @@ func TestUpdatePeerState(t *testing.T) {
 	status := NewRecorder("https://mgm")
 	peerState := State{
 		PubKey: key,
+		Mux:    new(sync.RWMutex),
 	}
 
 	status.peers[key] = peerState
@@ -62,6 +64,7 @@ func TestStatus_UpdatePeerFQDN(t *testing.T) {
 	status := NewRecorder("https://mgm")
 	peerState := State{
 		PubKey: key,
+		Mux:    new(sync.RWMutex),
 	}
 
 	status.peers[key] = peerState
@@ -80,6 +83,7 @@ func TestGetPeerStateChangeNotifierLogic(t *testing.T) {
 	status := NewRecorder("https://mgm")
 	peerState := State{
 		PubKey: key,
+		Mux:    new(sync.RWMutex),
 	}
 
 	status.peers[key] = peerState
@@ -89,7 +93,7 @@ func TestGetPeerStateChangeNotifierLogic(t *testing.T) {
 
 	peerState.IP = ip
 
-	err := status.UpdatePeerState(peerState)
+	err := status.UpdatePeerRelayedStateToDisconnected(peerState)
 	assert.NoError(t, err, "shouldn't return error")
 
 	select {
@@ -104,6 +108,7 @@ func TestRemovePeer(t *testing.T) {
 	status := NewRecorder("https://mgm")
 	peerState := State{
 		PubKey: key,
+		Mux:    new(sync.RWMutex),
 	}
 
 	status.peers[key] = peerState

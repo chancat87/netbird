@@ -10,9 +10,10 @@ type Preferences struct {
 }
 
 // NewPreferences create new Preferences instance
-func NewPreferences(configPath string) *Preferences {
+func NewPreferences(configPath string, stateFilePath string) *Preferences {
 	ci := internal.ConfigInput{
-		ConfigPath: configPath,
+		ConfigPath:    configPath,
+		StateFilePath: stateFilePath,
 	}
 	return &Preferences{ci}
 }
@@ -69,6 +70,42 @@ func (p *Preferences) GetPreSharedKey() (string, error) {
 // SetPreSharedKey store the given key and wait for commit
 func (p *Preferences) SetPreSharedKey(key string) {
 	p.configInput.PreSharedKey = &key
+}
+
+// SetRosenpassEnabled store if rosenpass is enabled
+func (p *Preferences) SetRosenpassEnabled(enabled bool) {
+	p.configInput.RosenpassEnabled = &enabled
+}
+
+// GetRosenpassEnabled read rosenpass enabled from config file
+func (p *Preferences) GetRosenpassEnabled() (bool, error) {
+	if p.configInput.RosenpassEnabled != nil {
+		return *p.configInput.RosenpassEnabled, nil
+	}
+
+	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	if err != nil {
+		return false, err
+	}
+	return cfg.RosenpassEnabled, err
+}
+
+// SetRosenpassPermissive store the given permissive and wait for commit
+func (p *Preferences) SetRosenpassPermissive(permissive bool) {
+	p.configInput.RosenpassPermissive = &permissive
+}
+
+// GetRosenpassPermissive read rosenpass permissive from config file
+func (p *Preferences) GetRosenpassPermissive() (bool, error) {
+	if p.configInput.RosenpassPermissive != nil {
+		return *p.configInput.RosenpassPermissive, nil
+	}
+
+	cfg, err := internal.ReadConfig(p.configInput.ConfigPath)
+	if err != nil {
+		return false, err
+	}
+	return cfg.RosenpassPermissive, err
 }
 
 // Commit write out the changes into config file

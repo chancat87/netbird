@@ -50,7 +50,7 @@ check_jq() {
 wait_crdb() {
   set +e
   while true; do
-    if $DOCKER_COMPOSE_COMMAND exec -T crdb curl -sf -o /dev/null 'http://localhost:8080/health?ready=1'; then
+    if $DOCKER_COMPOSE_COMMAND exec -T zdb curl -sf -o /dev/null 'http://localhost:8080/health?ready=1'; then
       break
     fi
     echo -n " ."
@@ -61,14 +61,16 @@ wait_crdb() {
 }
 
 init_crdb() {
-  echo -e "\nInitializing Zitadel's CockroachDB\n\n"
-  $DOCKER_COMPOSE_COMMAND up -d crdb
-  echo ""
-  # shellcheck disable=SC2028
-  echo -n "Waiting cockroachDB  to become ready "
-  wait_crdb
-  $DOCKER_COMPOSE_COMMAND exec -T crdb /bin/bash -c "cp /cockroach/certs/* /zitadel-certs/ && cockroach cert create-client --overwrite --certs-dir /zitadel-certs/ --ca-key /zitadel-certs/ca.key zitadel_user && chown -R 1000:1000 /zitadel-certs/"
-  handle_request_command_status $? "init_crdb failed" ""
+  if [[ $ZITADEL_DATABASE == "cockroach" ]]; then
+    echo -e "\nInitializing Zitadel's CockroachDB\n\n"
+    $DOCKER_COMPOSE_COMMAND up -d zdb
+    echo ""
+    # shellcheck disable=SC2028
+    echo -n "Waiting CockroachDB to become ready"
+    wait_crdb
+    $DOCKER_COMPOSE_COMMAND exec -T zdb /bin/bash -c "cp /cockroach/certs/* /zitadel-certs/ && cockroach cert create-client --overwrite --certs-dir /zitadel-certs/ --ca-key /zitadel-certs/ca.key zitadel_user && chown -R 1000:1000 /zitadel-certs/"
+    handle_request_command_status $? "init_crdb failed" ""
+  fi
 }
 
 get_main_ip_address() {
@@ -101,13 +103,25 @@ wait_api() {
     INSTANCE_URL=$1
     PAT=$2
     set +e
+    counter=1
     while true; do
-      curl -s --fail -o /dev/null "$INSTANCE_URL/auth/v1/users/me" -H "Authorization: Bearer $PAT"
+      FLAGS="-s"
+      if [[ $counter -eq 45 ]]; then
+        FLAGS="-v"
+        echo ""
+      fi
+
+      curl $FLAGS --fail --connect-timeout 1 -o /dev/null "$INSTANCE_URL/auth/v1/users/me" -H "Authorization: Bearer $PAT"
       if [[ $? -eq 0 ]]; then
         break
       fi
+      if [[ $counter -eq 45 ]]; then
+        echo ""
+        echo "Unable to connect to Zitadel for more than 45s, please check the output above, your firewall rules and the caddy container logs to confirm if there are any issues provisioning TLS certificates"
+      fi
       echo -n " ."
       sleep 1
+      counter=$((counter + 1))
     done
     echo " done"
     set -e
@@ -137,6 +151,13 @@ create_new_application() {
   BASE_REDIRECT_URL2=$5
   LOGOUT_URL=$6
   ZITADEL_DEV_MODE=$7
+  DEVICE_CODE=$8
+
+  if [[ $DEVICE_CODE == "true" ]]; then
+    GRANT_TYPES='["OIDC_GRANT_TYPE_AUTHORIZATION_CODE","OIDC_GRANT_TYPE_DEVICE_CODE","OIDC_GRANT_TYPE_REFRESH_TOKEN"]'
+  else
+    GRANT_TYPES='["OIDC_GRANT_TYPE_AUTHORIZATION_CODE","OIDC_GRANT_TYPE_REFRESH_TOKEN"]'
+  fi
 
   RESPONSE=$(
     curl -sS -X POST "$INSTANCE_URL/management/v1/projects/$PROJECT_ID/apps/oidc" \
@@ -149,15 +170,12 @@ create_new_application() {
       "'"$BASE_REDIRECT_URL2"'"
     ],
     "postLogoutRedirectUris": [
-       "'"$LOGOUT_URL"'"
+      "'"$LOGOUT_URL"'"
     ],
     "RESPONSETypes": [
       "OIDC_RESPONSE_TYPE_CODE"
     ],
-    "grantTypes": [
-      "OIDC_GRANT_TYPE_AUTHORIZATION_CODE",
-      "OIDC_GRANT_TYPE_REFRESH_TOKEN"
-    ],
+    "grantTypes": '"$GRANT_TYPES"',
     "appType": "OIDC_APP_TYPE_USER_AGENT",
     "authMethodType": "OIDC_AUTH_METHOD_TYPE_NONE",
     "version": "OIDC_VERSION_1_0",
@@ -340,10 +358,10 @@ init_zitadel() {
 
   # create zitadel spa applications
   echo "Creating new Zitadel SPA Dashboard application"
-  DASHBOARD_APPLICATION_CLIENT_ID=$(create_new_application "$INSTANCE_URL" "$PAT" "Dashboard" "$BASE_REDIRECT_URL/nb-auth" "$BASE_REDIRECT_URL/nb-silent-auth" "$BASE_REDIRECT_URL/" "$ZITADEL_DEV_MODE")
+  DASHBOARD_APPLICATION_CLIENT_ID=$(create_new_application "$INSTANCE_URL" "$PAT" "Dashboard" "$BASE_REDIRECT_URL/nb-auth" "$BASE_REDIRECT_URL/nb-silent-auth" "$BASE_REDIRECT_URL/" "$ZITADEL_DEV_MODE" "false")
 
   echo "Creating new Zitadel SPA Cli application"
-  CLI_APPLICATION_CLIENT_ID=$(create_new_application "$INSTANCE_URL" "$PAT" "Cli" "http://localhost:53000/" "http://localhost:54000/" "http://localhost:53000/" "true")
+  CLI_APPLICATION_CLIENT_ID=$(create_new_application "$INSTANCE_URL" "$PAT" "Cli" "http://localhost:53000/" "http://localhost:54000/" "http://localhost:53000/" "true" "true")
 
   MACHINE_USER_ID=$(create_service_user "$INSTANCE_URL" "$PAT")
 
@@ -418,8 +436,10 @@ initEnvironment() {
   ZITADEL_MASTERKEY="$(openssl rand -base64 32 | head -c 32)"
   NETBIRD_PORT=80
   NETBIRD_HTTP_PROTOCOL="http"
+  NETBIRD_RELAY_PROTO="rel"
   TURN_USER="self"
   TURN_PASSWORD=$(openssl rand -base64 32 | sed 's/=//g')
+  NETBIRD_RELAY_AUTH_SECRET=$(openssl rand -base64 32 | sed 's/=//g')
   TURN_MIN_PORT=49152
   TURN_MAX_PORT=65535
   TURN_EXTERNAL_IP_CONFIG=$(get_turn_external_ip)
@@ -436,6 +456,7 @@ initEnvironment() {
     NETBIRD_PORT=443
     CADDY_SECURE_DOMAIN=", $NETBIRD_DOMAIN:$NETBIRD_PORT"
     NETBIRD_HTTP_PROTOCOL="https"
+    NETBIRD_RELAY_PROTO="rels"
   fi
 
   if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -452,9 +473,23 @@ initEnvironment() {
     echo "Generated files already exist, if you want to reinitialize the environment, please remove them first."
     echo "You can use the following commands:"
     echo "  $DOCKER_COMPOSE_COMMAND down --volumes # to remove all containers and volumes"
-    echo "  rm -f docker-compose.yml Caddyfile zitadel.env dashboard.env machinekey/zitadel-admin-sa.token turnserver.conf management.json"
+    echo "  rm -f docker-compose.yml Caddyfile zitadel.env dashboard.env machinekey/zitadel-admin-sa.token turnserver.conf management.json relay.env"
     echo "Be aware that this will remove all data from the database, and you will have to reconfigure the dashboard."
     exit 1
+  fi
+
+  if [[ $ZITADEL_DATABASE == "cockroach" ]]; then
+        echo "Use CockroachDB as Zitadel database."
+        ZDB=$(renderDockerComposeCockroachDB)
+        ZITADEL_DB_ENV=$(renderZitadelCockroachDBEnv)
+  else
+      echo "Use Postgres as default Zitadel database."
+      echo "For using CockroachDB please the environment variable 'export ZITADEL_DATABASE=cockroach'."
+      POSTGRES_ROOT_PASSWORD="$(openssl rand -base64 32 | sed 's/=//g')@"
+      POSTGRES_ZITADEL_PASSWORD="$(openssl rand -base64 32 | sed 's/=//g')@"
+      ZDB=$(renderDockerComposePostgres)
+      ZITADEL_DB_ENV=$(renderZitadelPostgresEnv)
+      renderPostgresEnv > zdb.env
   fi
 
   echo Rendering initial files...
@@ -464,13 +499,14 @@ initEnvironment() {
   echo "" > dashboard.env
   echo "" > turnserver.conf
   echo "" > management.json
+  echo "" > relay.env
 
   mkdir -p machinekey
   chmod 777 machinekey
 
   init_crdb
 
-  echo -e "\nStarting Zidatel IDP for user management\n\n"
+  echo -e "\nStarting Zitadel IDP for user management\n\n"
   $DOCKER_COMPOSE_COMMAND up -d caddy zitadel
   init_zitadel
 
@@ -478,6 +514,7 @@ initEnvironment() {
   renderTurnServerConf > turnserver.conf
   renderManagementJson > management.json
   renderDashboardEnv > dashboard.env
+  renderRelayEnv > relay.env
 
   echo -e "\nStarting NetBird services\n"
   $DOCKER_COMPOSE_COMMAND up -d
@@ -493,7 +530,7 @@ renderCaddyfile() {
 {
   debug
 	servers :80,:443 {
-    protocols h1 h2c
+    protocols h1 h2c h2 h3
   }
 }
 
@@ -521,7 +558,7 @@ renderCaddyfile() {
 
         # clickjacking protection
         # https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html#x-frame-options
-        X-Frame-Options "DENY"
+        X-Frame-Options "SAMEORIGIN"
 
         # xss protection
         # https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html#x-xss-protection
@@ -539,6 +576,8 @@ renderCaddyfile() {
 
 :80${CADDY_SECURE_DOMAIN} {
     import security_headers
+    # relay
+    reverse_proxy /relay* relay:80
     # Signal
     reverse_proxy /signalexchange.SignalExchange/* h2c://signal:10000
     # Management
@@ -561,6 +600,8 @@ renderCaddyfile() {
     reverse_proxy /.well-known/openid-configuration h2c://zitadel:8080
     reverse_proxy /openapi/* h2c://zitadel:8080
     reverse_proxy /debug/* h2c://zitadel:8080
+    reverse_proxy /device/* h2c://zitadel:8080
+    reverse_proxy /device h2c://zitadel:8080
     # Dashboard
     reverse_proxy /* dashboard:80
 }
@@ -607,6 +648,11 @@ renderManagementJson() {
         ],
         "TimeBasedCredentials": false
     },
+    "Relay": {
+        "Addresses": ["$NETBIRD_RELAY_PROTO://$NETBIRD_DOMAIN:$NETBIRD_PORT"],
+        "CredentialsTTL": "24h",
+        "Secret": "$NETBIRD_RELAY_AUTH_SECRET"
+    },
     "Signal": {
         "Proto": "$NETBIRD_HTTP_PROTOCOL",
         "URI": "$NETBIRD_DOMAIN:$NETBIRD_PORT"
@@ -628,7 +674,15 @@ renderManagementJson() {
         "ExtraConfig": {
             "ManagementEndpoint": "$NETBIRD_HTTP_PROTOCOL://$NETBIRD_DOMAIN/management/v1"
         }
-     },
+    },
+  "DeviceAuthorizationFlow": {
+      "Provider": "hosted",
+      "ProviderConfig": {
+          "Audience": "$NETBIRD_AUTH_CLIENT_ID_CLI",
+          "ClientID": "$NETBIRD_AUTH_CLIENT_ID_CLI",
+          "Scope": "openid"
+      }
+    },
     "PKCEAuthorizationFlow": {
         "ProviderConfig": {
             "Audience": "$NETBIRD_AUTH_CLIENT_ID_CLI",
@@ -665,16 +719,6 @@ renderZitadelEnv() {
   cat <<EOF
 ZITADEL_LOG_LEVEL=debug
 ZITADEL_MASTERKEY=$ZITADEL_MASTERKEY
-ZITADEL_DATABASE_COCKROACH_HOST=crdb
-ZITADEL_DATABASE_COCKROACH_USER_USERNAME=zitadel_user
-ZITADEL_DATABASE_COCKROACH_USER_SSL_MODE=verify-full
-ZITADEL_DATABASE_COCKROACH_USER_SSL_ROOTCERT="/crdb-certs/ca.crt"
-ZITADEL_DATABASE_COCKROACH_USER_SSL_CERT="/crdb-certs/client.zitadel_user.crt"
-ZITADEL_DATABASE_COCKROACH_USER_SSL_KEY="/crdb-certs/client.zitadel_user.key"
-ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_MODE=verify-full
-ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_ROOTCERT="/crdb-certs/ca.crt"
-ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_CERT="/crdb-certs/client.root.crt"
-ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_KEY="/crdb-certs/client.root.key"
 ZITADEL_EXTERNALSECURE=$ZITADEL_EXTERNALSECURE
 ZITADEL_TLS_ENABLED="false"
 ZITADEL_EXTERNALPORT=$NETBIRD_PORT
@@ -684,6 +728,52 @@ ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME=zitadel-admin-sa
 ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME=Admin
 ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_SCOPES=openid
 ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE=$ZIDATE_TOKEN_EXPIRATION_DATE
+$ZITADEL_DB_ENV
+EOF
+}
+
+renderZitadelCockroachDBEnv() {
+  cat <<EOF
+ZITADEL_DATABASE_COCKROACH_HOST=zdb
+ZITADEL_DATABASE_COCKROACH_USER_USERNAME=zitadel_user
+ZITADEL_DATABASE_COCKROACH_USER_SSL_MODE=verify-full
+ZITADEL_DATABASE_COCKROACH_USER_SSL_ROOTCERT="/zdb-certs/ca.crt"
+ZITADEL_DATABASE_COCKROACH_USER_SSL_CERT="/zdb-certs/client.zitadel_user.crt"
+ZITADEL_DATABASE_COCKROACH_USER_SSL_KEY="/zdb-certs/client.zitadel_user.key"
+ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_MODE=verify-full
+ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_ROOTCERT="/zdb-certs/ca.crt"
+ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_CERT="/zdb-certs/client.root.crt"
+ZITADEL_DATABASE_COCKROACH_ADMIN_SSL_KEY="/zdb-certs/client.root.key"
+EOF
+}
+
+renderZitadelPostgresEnv() {
+  cat <<EOF
+ZITADEL_DATABASE_POSTGRES_HOST=zdb
+ZITADEL_DATABASE_POSTGRES_PORT=5432
+ZITADEL_DATABASE_POSTGRES_DATABASE=zitadel
+ZITADEL_DATABASE_POSTGRES_USER_USERNAME=zitadel
+ZITADEL_DATABASE_POSTGRES_USER_PASSWORD=$POSTGRES_ZITADEL_PASSWORD
+ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE=disable
+ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME=root
+ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD=$POSTGRES_ROOT_PASSWORD
+ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE=disable
+EOF
+}
+
+renderPostgresEnv() {
+  cat <<EOF
+POSTGRES_USER=root
+POSTGRES_PASSWORD=$POSTGRES_ROOT_PASSWORD
+EOF
+}
+
+renderRelayEnv() {
+  cat <<EOF
+NB_LOG_LEVEL=info
+NB_LISTEN_ADDRESS=:80
+NB_EXPOSED_ADDRESS=$NETBIRD_RELAY_PROTO://$NETBIRD_DOMAIN:$NETBIRD_PORT
+NB_AUTH_SECRET=$NETBIRD_RELAY_AUTH_SECRET
 EOF
 }
 
@@ -698,23 +788,51 @@ services:
     networks: [ netbird ]
     ports:
       - '443:443'
+      - '443:443/udp'
       - '80:80'
       - '8080:8080'
     volumes:
       - netbird_caddy_data:/data
       - ./Caddyfile:/etc/caddy/Caddyfile
-  #UI dashboard
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
+  # UI dashboard
   dashboard:
     image: netbirdio/dashboard:latest
     restart: unless-stopped
     networks: [netbird]
     env_file:
       - ./dashboard.env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
   # Signal
   signal:
     image: netbirdio/signal:latest
     restart: unless-stopped
     networks: [netbird]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
+  # Relay
+  relay:
+    image: netbirdio/relay:latest
+    restart: unless-stopped
+    networks: [netbird]
+    env_file:
+      - ./relay.env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
   # Management
   management:
     image: netbirdio/management:latest
@@ -732,39 +850,67 @@ services:
       "--dns-domain=netbird.selfhosted",
       "--idp-sign-key-refresh-enabled",
     ]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
   # Coturn, AKA relay server
   coturn:
     image: coturn/coturn
     restart: unless-stopped
-    domainname: netbird.relay.selfhosted
+    #domainname: netbird.relay.selfhosted
     volumes:
       - ./turnserver.conf:/etc/turnserver.conf:ro
     network_mode: host
     command:
       - -c /etc/turnserver.conf
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
   # Zitadel - identity provider
   zitadel:
     restart: 'always'
     networks: [netbird]
-    image: 'ghcr.io/zitadel/zitadel:v2.31.3'
+    image: 'ghcr.io/zitadel/zitadel:v2.64.1'
     command: 'start-from-init --masterkeyFromEnv --tlsMode $ZITADEL_TLS_MODE'
     env_file:
       - ./zitadel.env
     depends_on:
-      crdb:
+      zdb:
         condition: 'service_healthy'
     volumes:
       - ./machinekey:/machinekey
-      - netbird_zitadel_certs:/crdb-certs:ro
-  # CockroachDB for zitadel
-  crdb:
+      - netbird_zitadel_certs:/zdb-certs:ro
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
+$ZDB
+  netbird_zdb_data:
+  netbird_management:
+  netbird_caddy_data:
+  netbird_zitadel_certs:
+
+networks:
+  netbird:
+EOF
+}
+
+renderDockerComposeCockroachDB() {
+  cat <<EOF
+  # CockroachDB for Zitadel
+  zdb:
     restart: 'always'
     networks: [netbird]
-    image: 'cockroachdb/cockroach:v22.2.2'
-    command: 'start-single-node --advertise-addr crdb'
+    image: 'cockroachdb/cockroach:latest-v23.2'
+    command: 'start-single-node --advertise-addr zdb'
     volumes:
-      - netbird_crdb_data:/cockroach/cockroach-data
-      - netbird_crdb_certs:/cockroach/certs
+      - netbird_zdb_data:/cockroach/cockroach-data
+      - netbird_zdb_certs:/cockroach/certs
       - netbird_zitadel_certs:/zitadel-certs
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:8080/health?ready=1" ]
@@ -772,16 +918,40 @@ services:
       timeout: '30s'
       retries: 5
       start_period: '20s'
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
 
 volumes:
-  netbird_management:
-  netbird_caddy_data:
-  netbird_crdb_data:
-  netbird_crdb_certs:
-  netbird_zitadel_certs:
+  netbird_zdb_certs:
+EOF
+}
 
-networks:
-  netbird:
+renderDockerComposePostgres() {
+  cat <<EOF
+  # Postgres for Zitadel
+  zdb:
+    restart: 'always'
+    networks: [netbird]
+    image: 'postgres:16-alpine'
+    env_file:
+      - ./zdb.env
+    volumes:
+      - netbird_zdb_data:/var/lib/postgresql/data:rw
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready", "-d", "db_prod"]
+      interval: 5s
+      timeout: 60s
+      retries: 10
+      start_period: 5s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "2"
+volumes:
 EOF
 }
 

@@ -1,11 +1,17 @@
 package firewall
 
-import "github.com/netbirdio/netbird/iface"
+import (
+	wgdevice "golang.zx2c4.com/wireguard/device"
+
+	"github.com/netbirdio/netbird/client/iface/device"
+)
 
 // IFaceMapper defines subset methods of interface required for manager
 type IFaceMapper interface {
 	Name() string
-	Address() iface.WGAddress
+	Address() device.WGAddress
 	IsUserspaceBind() bool
-	SetFilter(iface.PacketFilter) error
+	SetFilter(device.PacketFilter) error
+	GetDevice() *device.FilteredDevice
+	GetWGDevice() *wgdevice.Device
 }

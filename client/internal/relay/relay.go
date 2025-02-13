@@ -10,11 +10,14 @@ import (
 	"github.com/pion/stun/v2"
 	"github.com/pion/turn/v3"
 	log "github.com/sirupsen/logrus"
+
+	"github.com/netbirdio/netbird/client/internal/stdnet"
+	nbnet "github.com/netbirdio/netbird/util/net"
 )
 
 // ProbeResult holds the info about the result of a relay probe request
 type ProbeResult struct {
-	URI  *stun.URI
+	URI  string
 	Err  error
 	Addr string
 }
@@ -27,7 +30,15 @@ func ProbeSTUN(ctx context.Context, uri *stun.URI) (addr string, probeErr error)
 		}
 	}()
 
-	client, err := stun.DialURI(uri, &stun.DialConfig{})
+	net, err := stdnet.NewNet(nil)
+	if err != nil {
+		probeErr = fmt.Errorf("new net: %w", err)
+		return
+	}
+
+	client, err := stun.DialURI(uri, &stun.DialConfig{
+		Net: net,
+	})
 	if err != nil {
 		probeErr = fmt.Errorf("dial: %w", err)
 		return
@@ -85,14 +96,13 @@ func ProbeTURN(ctx context.Context, uri *stun.URI) (addr string, probeErr error)
 	switch uri.Proto {
 	case stun.ProtoTypeUDP:
 		var err error
-		conn, err = net.ListenPacket("udp", "")
+		conn, err = nbnet.NewListener().ListenPacket(ctx, "udp", "")
 		if err != nil {
 			probeErr = fmt.Errorf("listen: %w", err)
 			return
 		}
 	case stun.ProtoTypeTCP:
-		dialer := net.Dialer{}
-		tcpConn, err := dialer.DialContext(ctx, "tcp", turnServerAddr)
+		tcpConn, err := nbnet.NewDialer().DialContext(ctx, "tcp", turnServerAddr)
 		if err != nil {
 			probeErr = fmt.Errorf("dial: %w", err)
 			return
@@ -109,12 +119,18 @@ func ProbeTURN(ctx context.Context, uri *stun.URI) (addr string, probeErr error)
 		}
 	}()
 
+	net, err := stdnet.NewNet(nil)
+	if err != nil {
+		probeErr = fmt.Errorf("new net: %w", err)
+		return
+	}
 	cfg := &turn.ClientConfig{
 		STUNServerAddr: turnServerAddr,
 		TURNServerAddr: turnServerAddr,
 		Conn:           conn,
 		Username:       uri.Username,
 		Password:       uri.Password,
+		Net:            net,
 	}
 	client, err := turn.NewClient(cfg)
 	if err != nil {
@@ -154,13 +170,13 @@ func ProbeAll(
 
 	var wg sync.WaitGroup
 	for i, uri := range relays {
-		ctx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		defer cancel()
 
 		wg.Add(1)
 		go func(res *ProbeResult, stunURI *stun.URI) {
 			defer wg.Done()
-			res.URI = stunURI
+			res.URI = stunURI.String()
 			res.Addr, res.Err = fn(ctx, stunURI)
 		}(&results[i], uri)
 	}

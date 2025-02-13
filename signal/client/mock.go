@@ -1,18 +1,26 @@
 package client
 
 import (
+	"context"
+
 	"github.com/netbirdio/netbird/signal/proto"
 )
 
 type MockClient struct {
-	CloseFunc               func() error
-	GetStatusFunc           func() Status
-	StreamConnectedFunc     func() bool
-	ReadyFunc               func() bool
-	WaitStreamConnectedFunc func()
-	ReceiveFunc             func(msgHandler func(msg *proto.Message) error) error
-	SendToStreamFunc        func(msg *proto.EncryptedMessage) error
-	SendFunc                func(msg *proto.Message) error
+	CloseFunc                    func() error
+	GetStatusFunc                func() Status
+	StreamConnectedFunc          func() bool
+	ReadyFunc                    func() bool
+	WaitStreamConnectedFunc      func()
+	ReceiveFunc                  func(ctx context.Context, msgHandler func(msg *proto.Message) error) error
+	SendToStreamFunc             func(msg *proto.EncryptedMessage) error
+	SendFunc                     func(msg *proto.Message) error
+	SetOnReconnectedListenerFunc func(f func())
+}
+
+// SetOnReconnectedListener sets the function to be called when the client reconnects.
+func (sm *MockClient) SetOnReconnectedListener(_ func()) {
+	// Do nothing
 }
 
 func (sm *MockClient) IsHealthy() bool {
@@ -54,11 +62,11 @@ func (sm *MockClient) WaitStreamConnected() {
 	sm.WaitStreamConnectedFunc()
 }
 
-func (sm *MockClient) Receive(msgHandler func(msg *proto.Message) error) error {
+func (sm *MockClient) Receive(ctx context.Context, msgHandler func(msg *proto.Message) error) error {
 	if sm.ReceiveFunc == nil {
 		return nil
 	}
-	return sm.ReceiveFunc(msgHandler)
+	return sm.ReceiveFunc(ctx, msgHandler)
 }
 
 func (sm *MockClient) SendToStream(msg *proto.EncryptedMessage) error {

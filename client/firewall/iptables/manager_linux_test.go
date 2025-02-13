@@ -1,7 +1,6 @@
 package iptables
 
 import (
-	"context"
 	"fmt"
 	"net"
 	"testing"
@@ -11,8 +10,23 @@ import (
 	"github.com/stretchr/testify/require"
 
 	fw "github.com/netbirdio/netbird/client/firewall/manager"
-	"github.com/netbirdio/netbird/iface"
+	"github.com/netbirdio/netbird/client/iface"
 )
+
+var ifaceMock = &iFaceMock{
+	NameFunc: func() string {
+		return "lo"
+	},
+	AddressFunc: func() iface.WGAddress {
+		return iface.WGAddress{
+			IP: net.ParseIP("10.20.0.1"),
+			Network: &net.IPNet{
+				IP:   net.ParseIP("10.20.0.0"),
+				Mask: net.IPv4Mask(255, 255, 255, 0),
+			},
+		}
+	},
+}
 
 // iFaceMapper defines subset methods of interface required for manager
 type iFaceMock struct {
@@ -40,55 +54,28 @@ func TestIptablesManager(t *testing.T) {
 	ipv4Client, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 	require.NoError(t, err)
 
-	mock := &iFaceMock{
-		NameFunc: func() string {
-			return "lo"
-		},
-		AddressFunc: func() iface.WGAddress {
-			return iface.WGAddress{
-				IP: net.ParseIP("10.20.0.1"),
-				Network: &net.IPNet{
-					IP:   net.ParseIP("10.20.0.0"),
-					Mask: net.IPv4Mask(255, 255, 255, 0),
-				},
-			}
-		},
-	}
-
 	// just check on the local interface
-	manager, err := Create(context.Background(), mock)
+	manager, err := Create(ifaceMock)
 	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
 
 	time.Sleep(time.Second)
 
 	defer func() {
-		err := manager.Reset()
+		err := manager.Reset(nil)
 		require.NoError(t, err, "clear the manager state")
 
 		time.Sleep(time.Second)
 	}()
 
-	var rule1 []fw.Rule
-	t.Run("add first rule", func(t *testing.T) {
-		ip := net.ParseIP("10.20.0.2")
-		port := &fw.Port{Values: []int{8080}}
-		rule1, err = manager.AddFiltering(ip, "tcp", nil, port, fw.RuleDirectionOUT, fw.ActionAccept, "", "accept HTTP traffic")
-		require.NoError(t, err, "failed to add rule")
-
-		for _, r := range rule1 {
-			checkRuleSpecs(t, ipv4Client, chainNameOutputRules, true, r.(*Rule).specs...)
-		}
-
-	})
-
 	var rule2 []fw.Rule
 	t.Run("add second rule", func(t *testing.T) {
 		ip := net.ParseIP("10.20.0.3")
 		port := &fw.Port{
-			Values: []int{8043: 8046},
+			IsRange: true,
+			Values:  []uint16{8043, 8046},
 		}
-		rule2, err = manager.AddFiltering(
-			ip, "tcp", port, nil, fw.RuleDirectionIN, fw.ActionAccept, "", "accept HTTPS traffic from ports range")
+		rule2, err = manager.AddPeerFiltering(ip, "tcp", port, nil, fw.ActionAccept, "", "accept HTTPS traffic from ports range")
 		require.NoError(t, err, "failed to add rule")
 
 		for _, r := range rule2 {
@@ -97,18 +84,9 @@ func TestIptablesManager(t *testing.T) {
 		}
 	})
 
-	t.Run("delete first rule", func(t *testing.T) {
-		for _, r := range rule1 {
-			err := manager.DeleteRule(r)
-			require.NoError(t, err, "failed to delete rule")
-
-			checkRuleSpecs(t, ipv4Client, chainNameOutputRules, false, r.(*Rule).specs...)
-		}
-	})
-
 	t.Run("delete second rule", func(t *testing.T) {
 		for _, r := range rule2 {
-			err := manager.DeleteRule(r)
+			err := manager.DeletePeerRule(r)
 			require.NoError(t, err, "failed to delete rule")
 		}
 
@@ -118,11 +96,11 @@ func TestIptablesManager(t *testing.T) {
 	t.Run("reset check", func(t *testing.T) {
 		// add second rule
 		ip := net.ParseIP("10.20.0.3")
-		port := &fw.Port{Values: []int{5353}}
-		_, err = manager.AddFiltering(ip, "udp", nil, port, fw.RuleDirectionOUT, fw.ActionAccept, "", "accept Fake DNS traffic")
+		port := &fw.Port{Values: []uint16{5353}}
+		_, err = manager.AddPeerFiltering(ip, "udp", nil, port, fw.ActionAccept, "", "accept Fake DNS traffic")
 		require.NoError(t, err, "failed to add rule")
 
-		err = manager.Reset()
+		err = manager.Reset(nil)
 		require.NoError(t, err, "failed to reset")
 
 		ok, err := ipv4Client.ChainExists("filter", chainNameInputRules)
@@ -135,9 +113,6 @@ func TestIptablesManager(t *testing.T) {
 }
 
 func TestIptablesManagerIPSet(t *testing.T) {
-	ipv4Client, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
-	require.NoError(t, err)
-
 	mock := &iFaceMock{
 		NameFunc: func() string {
 			return "lo"
@@ -154,45 +129,26 @@ func TestIptablesManagerIPSet(t *testing.T) {
 	}
 
 	// just check on the local interface
-	manager, err := Create(context.Background(), mock)
+	manager, err := Create(mock)
 	require.NoError(t, err)
+	require.NoError(t, manager.Init(nil))
 
 	time.Sleep(time.Second)
 
 	defer func() {
-		err := manager.Reset()
+		err := manager.Reset(nil)
 		require.NoError(t, err, "clear the manager state")
 
 		time.Sleep(time.Second)
 	}()
 
-	var rule1 []fw.Rule
-	t.Run("add first rule with set", func(t *testing.T) {
-		ip := net.ParseIP("10.20.0.2")
-		port := &fw.Port{Values: []int{8080}}
-		rule1, err = manager.AddFiltering(
-			ip, "tcp", nil, port, fw.RuleDirectionOUT,
-			fw.ActionAccept, "default", "accept HTTP traffic",
-		)
-		require.NoError(t, err, "failed to add rule")
-
-		for _, r := range rule1 {
-			checkRuleSpecs(t, ipv4Client, chainNameOutputRules, true, r.(*Rule).specs...)
-			require.Equal(t, r.(*Rule).ipsetName, "default-dport", "ipset name must be set")
-			require.Equal(t, r.(*Rule).ip, "10.20.0.2", "ipset IP must be set")
-		}
-	})
-
 	var rule2 []fw.Rule
 	t.Run("add second rule", func(t *testing.T) {
 		ip := net.ParseIP("10.20.0.3")
 		port := &fw.Port{
-			Values: []int{443},
+			Values: []uint16{443},
 		}
-		rule2, err = manager.AddFiltering(
-			ip, "tcp", port, nil, fw.RuleDirectionIN, fw.ActionAccept,
-			"default", "accept HTTPS traffic from ports range",
-		)
+		rule2, err = manager.AddPeerFiltering(ip, "tcp", port, nil, fw.ActionAccept, "default", "accept HTTPS traffic from ports range")
 		for _, r := range rule2 {
 			require.NoError(t, err, "failed to add rule")
 			require.Equal(t, r.(*Rule).ipsetName, "default-sport", "ipset name must be set")
@@ -200,18 +156,9 @@ func TestIptablesManagerIPSet(t *testing.T) {
 		}
 	})
 
-	t.Run("delete first rule", func(t *testing.T) {
-		for _, r := range rule1 {
-			err := manager.DeleteRule(r)
-			require.NoError(t, err, "failed to delete rule")
-
-			require.NotContains(t, manager.aclMgr.ipsetStore.ipsets, r.(*Rule).ruleID, "rule must be removed form the ruleset index")
-		}
-	})
-
 	t.Run("delete second rule", func(t *testing.T) {
 		for _, r := range rule2 {
-			err := manager.DeleteRule(r)
+			err := manager.DeletePeerRule(r)
 			require.NoError(t, err, "failed to delete rule")
 
 			require.Empty(t, manager.aclMgr.ipsetStore.ipsets, "rulesets index after removed second rule must be empty")
@@ -219,7 +166,7 @@ func TestIptablesManagerIPSet(t *testing.T) {
 	})
 
 	t.Run("reset check", func(t *testing.T) {
-		err = manager.Reset()
+		err = manager.Reset(nil)
 		require.NoError(t, err, "failed to reset")
 	})
 }
@@ -251,12 +198,13 @@ func TestIptablesCreatePerformance(t *testing.T) {
 	for _, testMax := range []int{10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000} {
 		t.Run(fmt.Sprintf("Testing %d rules", testMax), func(t *testing.T) {
 			// just check on the local interface
-			manager, err := Create(context.Background(), mock)
+			manager, err := Create(mock)
 			require.NoError(t, err)
+			require.NoError(t, manager.Init(nil))
 			time.Sleep(time.Second)
 
 			defer func() {
-				err := manager.Reset()
+				err := manager.Reset(nil)
 				require.NoError(t, err, "clear the manager state")
 
 				time.Sleep(time.Second)
@@ -267,12 +215,8 @@ func TestIptablesCreatePerformance(t *testing.T) {
 			ip := net.ParseIP("10.20.0.100")
 			start := time.Now()
 			for i := 0; i < testMax; i++ {
-				port := &fw.Port{Values: []int{1000 + i}}
-				if i%2 == 0 {
-					_, err = manager.AddFiltering(ip, "tcp", nil, port, fw.RuleDirectionOUT, fw.ActionAccept, "", "accept HTTP traffic")
-				} else {
-					_, err = manager.AddFiltering(ip, "tcp", nil, port, fw.RuleDirectionIN, fw.ActionAccept, "", "accept HTTP traffic")
-				}
+				port := &fw.Port{Values: []uint16{uint16(1000 + i)}}
+				_, err = manager.AddPeerFiltering(ip, "tcp", nil, port, fw.ActionAccept, "", "accept HTTP traffic")
 
 				require.NoError(t, err, "failed to add rule")
 			}

@@ -2,7 +2,6 @@ package client
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"sync"
@@ -14,17 +13,14 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	"github.com/netbirdio/netbird/encryption"
+	"github.com/netbirdio/netbird/management/client"
 	"github.com/netbirdio/netbird/signal/proto"
+	nbgrpc "github.com/netbirdio/netbird/util/grpc"
 )
-
-const defaultSendTimeout = 5 * time.Second
 
 // ConnStateNotifier is a wrapper interface of the status recorder
 type ConnStateNotifier interface {
@@ -47,6 +43,8 @@ type GrpcClient struct {
 
 	connStateCallback     ConnStateNotifier
 	connStateCallbackLock sync.RWMutex
+
+	onReconnectedListenerFn func()
 }
 
 func (c *GrpcClient) StreamConnected() bool {
@@ -64,27 +62,21 @@ func (c *GrpcClient) Close() error {
 
 // NewClient creates a new Signal client
 func NewClient(ctx context.Context, addr string, key wgtypes.Key, tlsEnabled bool) (*GrpcClient, error) {
+	var conn *grpc.ClientConn
 
-	transportOption := grpc.WithTransportCredentials(insecure.NewCredentials())
-
-	if tlsEnabled {
-		transportOption = grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{}))
+	operation := func() error {
+		var err error
+		conn, err = nbgrpc.CreateConnection(addr, tlsEnabled)
+		if err != nil {
+			log.Printf("createConnection error: %v", err)
+			return err
+		}
+		return nil
 	}
 
-	sigCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	conn, err := grpc.DialContext(
-		sigCtx,
-		addr,
-		transportOption,
-		grpc.WithBlock(),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:    30 * time.Second,
-			Timeout: 10 * time.Second,
-		}))
-
+	err := backoff.Retry(operation, nbgrpc.Backoff(ctx))
 	if err != nil {
-		log.Errorf("failed to connect to the signalling server %v", err)
+		log.Errorf("failed to connect to the signalling server: %v", err)
 		return nil, err
 	}
 
@@ -125,9 +117,9 @@ func defaultBackoff(ctx context.Context) backoff.BackOff {
 // The messages will be handled by msgHandler function provided.
 // This function is blocking and reconnects to the Signal Exchange if errors occur (e.g. Exchange restart)
 // The connection retry logic will try to reconnect for 30 min and if wasn't successful will propagate the error to the function caller.
-func (c *GrpcClient) Receive(msgHandler func(msg *proto.Message) error) error {
+func (c *GrpcClient) Receive(ctx context.Context, msgHandler func(msg *proto.Message) error) error {
 
-	var backOff = defaultBackoff(c.ctx)
+	var backOff = defaultBackoff(ctx)
 
 	operation := func() error {
 
@@ -138,13 +130,13 @@ func (c *GrpcClient) Receive(msgHandler func(msg *proto.Message) error) error {
 		if connState == connectivity.Shutdown {
 			return backoff.Permanent(fmt.Errorf("connection to signal has been shut down"))
 		} else if !(connState == connectivity.Ready || connState == connectivity.Idle) {
-			c.signalConn.WaitForStateChange(c.ctx, connState)
+			c.signalConn.WaitForStateChange(ctx, connState)
 			return fmt.Errorf("connection to signal is not ready and in %s state", connState)
 		}
 
 		// connect to Signal stream identifying ourselves with a public WireGuard key
 		// todo once the key rotation logic has been implemented, consider changing to some other identifier (received from management)
-		ctx, cancelStream := context.WithCancel(c.ctx)
+		ctx, cancelStream := context.WithCancel(ctx)
 		defer cancelStream()
 		stream, err := c.connect(ctx, c.key.PublicKey().String())
 		if err != nil {
@@ -191,11 +183,16 @@ func (c *GrpcClient) notifyStreamDisconnected() {
 func (c *GrpcClient) notifyStreamConnected() {
 	c.mux.Lock()
 	defer c.mux.Unlock()
+
 	c.status = StreamConnected
 	if c.connectedCh != nil {
 		// there are goroutines waiting on this channel -> release them
 		close(c.connectedCh)
 		c.connectedCh = nil
+	}
+
+	if c.onReconnectedListenerFn != nil {
+		c.onReconnectedListenerFn()
 	}
 }
 
@@ -281,6 +278,13 @@ func (c *GrpcClient) WaitStreamConnected() {
 	}
 }
 
+func (c *GrpcClient) SetOnReconnectedListener(fn func()) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	c.onReconnectedListenerFn = fn
+}
+
 // SendToStream sends a message to the remote Peer through the Signal Exchange using established stream connection to the Signal Server
 // The GrpcClient.Receive method must be called before sending messages to establish initial connection to the Signal Exchange
 // GrpcClient.connWg can be used to wait
@@ -353,7 +357,7 @@ func (c *GrpcClient) Send(msg *proto.Message) error {
 		return err
 	}
 
-	attemptTimeout := defaultSendTimeout
+	attemptTimeout := client.ConnectTimeout
 
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 1 {
@@ -407,7 +411,7 @@ func (c *GrpcClient) receive(stream proto.SignalExchange_ConnectStreamClient,
 
 		if err != nil {
 			log.Errorf("error while handling message of Peer [key: %s] error: [%s]", msg.Key, err.Error())
-			//todo send something??
+			// todo send something??
 		}
 	}
 }
